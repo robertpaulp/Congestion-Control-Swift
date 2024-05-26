@@ -1,12 +1,14 @@
-// -*- c-basic-offset: 4; indent-tabs-mode: nil -*- 
 #include <math.h>
 #include <iostream>
 #include <algorithm>
+#include <unordered_map>
 #include "cc.h"
 #include "queue.h"
 #include <stdio.h>
 #include "switch.h"
 #include "ecn.h"
+#include <chrono>
+
 using namespace std;
 
 ////////////////////////////////////////////////////////////////
@@ -14,6 +16,21 @@ using namespace std;
 //  un algoritm de congestion control se gaseste aici.
 ////////////////////////////////////////////////////////////////
 int CCSrc::_global_node_count = 0;
+
+double _cwnd_prev;
+double _max_cwnd;
+double _min_cwnd;
+double _alpha;
+double _beta;
+simtime_picosec _lastDecrease;
+double _ai;
+double _fsRange;
+double _max_mdfs;
+double _hops;
+double _hop_scale;
+int _retransmit_count;
+const int RETX_RESET_THRESHOLD = 3; // Example threshold, commonly set to 3
+double _pacing_delay;
 
 CCSrc::CCSrc(EventList &eventlist)
     : EventSource(eventlist,"cc"), _flow(NULL)
@@ -31,6 +48,20 @@ CCSrc::CCSrc(EventList &eventlist)
     _nodename = "CCsrc " + to_string(_node_num);
 
     _cwnd = 10 * _mss;
+    _max_cwnd = 100000 * _mss;
+    _min_cwnd = _mss;
+    _cwnd_prev = _cwnd;
+    _ai = 10;
+    _max_mdfs = 10;
+    _fsRange = 2;
+    _pacing_delay = 0;
+    _hops = 3;
+    _hop_scale = 1;
+    _retransmit_count = 0;
+    _alpha = _fsRange / ((1/sqrt(_min_cwnd))-(1/sqrt(_max_cwnd)));
+    _beta = -1 * _alpha / sqrt(_max_cwnd);
+    _lastDecrease = eventlist.now();
+ 
     _ssthresh = 0xFFFFFFFFFF;
     _flightsize = 0;
     _flow._name = _nodename;
@@ -39,7 +70,7 @@ CCSrc::CCSrc(EventList &eventlist)
 
 /* Porneste transmisia fluxului de octeti */
 void CCSrc::startflow(){
-    cout << "Start flow " << _flow._name << " at " << timeAsSec(eventlist().now()) << "s" << endl;
+    // cout << "Start flow " << _flow._name << " at " << timeAsSec(eventlist().now()) << "s" << endl;
     _flow_started = true;
     _highest_sent = 0;
     _packets_sent = 0;
@@ -60,7 +91,6 @@ void CCSrc::connect(Route* routeout, Route* routeback, CCSink& sink, simtime_pic
     eventlist().sourceIsPending(*this,starttime);
 }
 
-
 /* Variabilele cu care vom lucra:
     _nacks_received
     _flightsize -> numarul de bytes aflati in zbor
@@ -80,56 +110,104 @@ void CCSrc::connect(Route* routeout, Route* routeback, CCSink& sink, simtime_pic
 */
 /* TODO: In mare parte aici vom avea implementarea algoritmului si in functie de nevoie in celelalte functii */
 
+unordered_map<uint32_t, simtime_picosec> sentTimestamps;
 
-//Aceasta functie este apelata atunci cand dimensiunea cozii a fost depasita iar packetul cu numarul de secventa ackno a fost aruncat.
-void CCSrc::processNack(const CCNack& nack){    
-    //cout << "CC " << _name << " got NACK " <<  nack.ackno() << _highest_sent << " at " << timeAsMs(eventlist().now()) << " us" << endl;    
-    _nacks_received ++;    
-    _flightsize -= _mss;    
-    
-    if (nack.ackno()>=_next_decision) {    
-        _cwnd = _cwnd / 2;    
-        if (_cwnd < _mss)    
-            _cwnd = _mss;    
-    
-        _ssthresh = _cwnd;
-            
-        //cout << "CWNDD " << _cwnd/_mss << endl; 
-        // eventlist.now
-    
-        _next_decision = _highest_sent + _cwnd;    
-    }    
-}    
-    
-/* Process an ACK.  Mostly just housekeeping*/    
-void CCSrc::processAck(const CCAck& ack) {    
-    CCAck::seq_t ackno = ack.ackno();    
-    
-    _acks_received++;    
-    _flightsize -= _mss;    
+double clamp(double min_val, double val, double max_val) {
+    return std::max(min_val, std::min(val, max_val));
+}
 
-    if (ack.is_ecn_marked()){
-        //Atunci cand un packet pleaca pe fir, el va fi marcat ECN doar daca dimensiunea cozii este mai mare decat threshold-ul ECN setat. Receptorul va copia acest marcaj in pachetul ACK. Transmitatorul poate lua in calcul reducerea ratei, ca in exemplul mai jos. 
-        if (ackno >=_next_decision){            
-            _cwnd = _cwnd / 2;
-            if (_cwnd < _mss)
-                _cwnd = _mss;
-            
-            _next_decision = _highest_sent + _cwnd;
+// Aceasta functie este apelata atunci cand dimensiunea cozii a fost depasita iar packetul cu numarul de secventa ackno a fost aruncat.
+void CCSrc::processAck(const CCAck& ack) {
+    CCAck::seq_t ackno = ack.ackno();
+    
+    _acks_received++;
+    _flightsize -= _mss;
+
+    simtime_picosec currentTimestamp = eventlist().now();
+    simtime_picosec sentTimestamp;
+    simtime_picosec rtt;
+
+    auto it = sentTimestamps.find(ackno);
+    if (it != sentTimestamps.end()) {
+        sentTimestamp = it->second;
+        rtt = currentTimestamp - sentTimestamp;
+        // cout << "RTT for sequence number " << ackno << ": " << timeAsMs(rtt) << " ms" << endl;
+        sentTimestamps.erase(it); // Remove the timestamp entry after calculating RTT
+    }
+
+    // Reset retransmission count on receiving a valid ACK
+    _retransmit_count = 0;
+
+    if (ack.is_ecn_marked()) {
+        // Handle ECN marked ACK
+        if (currentTimestamp - _lastDecrease >= timeAsMs(rtt)) {
+            _cwnd *= (1.0 - _beta); // Multiplicative decrease
+            _lastDecrease = currentTimestamp;
+        }
+    } else {
+        // Increase the congestion window
+        if (_cwnd < _ssthresh) {
+            // Slow start phase
+            _cwnd += _mss;    
+        } else {
+            // Congestion avoidance phase
+            _cwnd += (_ai * _mss) / _cwnd;
         }
     }
-    else {
-        //pachetul nu a fost marcat, putem creste rata.
-        if (_cwnd < _ssthresh)
-            //slow start.
-            _cwnd += _mss;    
-        else
-            //congestion avoidance.
-            _cwnd += _mss*_mss / _cwnd;
+
+    // Ensure the congestion window stays within bounds
+    _cwnd = clamp(_min_cwnd, _cwnd, _max_cwnd);
+    if (_cwnd <= _cwnd_prev) {
+        _lastDecrease = currentTimestamp;
     }
-    
-    //cout << "CWNDI " << _cwnd/_mss << endl;    
-}    
+
+    // Calculate pacing delay
+    _pacing_delay = timeAsMs(rtt) / _cwnd;
+
+    // Debugging information
+    // cout << "ACK processed: _cwnd=" << _cwnd << ", _pacing_delay=" << _pacing_delay << endl;
+
+    // Additional logic as needed
+}
+
+void CCSrc::processNack(const CCNack& nack) {
+    _nacks_received++;
+    _flightsize -= _mss;
+
+    simtime_picosec currentTimestamp = eventlist().now();
+    simtime_picosec sentTimestamp;
+    simtime_picosec rtt;
+
+    auto it = sentTimestamps.find(nack.ackno());
+    if (it != sentTimestamps.end()) {
+        sentTimestamp = it->second;
+        rtt = currentTimestamp - sentTimestamp;
+        // cout << "RTT for sequence number " << nack.ackno() << ": " << timeAsMs(rtt) << " ms" << endl;
+        sentTimestamps.erase(it); // Remove the timestamp entry after calculating RTT
+    }
+
+    // On Retransmit Timeout
+    _retransmit_count++;
+    if (_retransmit_count >= RETX_RESET_THRESHOLD) {
+        _cwnd = _min_cwnd; // Drastic reduction for repeated timeouts
+    } else {
+        _cwnd *= (1.0 - _beta); // Multiplicative decrease
+    }
+
+    // Ensure the congestion window stays within bounds
+    _cwnd = clamp(_min_cwnd, _cwnd, _max_cwnd);
+    if (_cwnd <= _cwnd_prev) {
+        _lastDecrease = currentTimestamp;
+    }
+
+    // Calculate pacing delay
+    _pacing_delay = timeAsMs(rtt) / _cwnd;
+
+    // Debugging information
+    // cout << "NACK processed: _cwnd=" << _cwnd << ", _pacing_delay=" << _pacing_delay << endl;
+
+    // Additional logic as needed
+}
 
 
 /* Functia de receptie, in functie de ce primeste cheama processLoss sau processACK */
@@ -149,7 +227,7 @@ void CCSrc::receivePacket(Packet& pkt)
         pkt.free();
         break;
     default:
-        cout << "Got packet with type " << pkt.type() << endl;
+        // cout << "Got packet with type " << pkt.type() << endl;
         abort();
     }
 
@@ -164,15 +242,19 @@ void CCSrc::send_packet() {
     CCPacket* p = NULL;
 
     assert(_flow_started);
+    simtime_picosec currentTimestamp = eventlist().now();
+    p = CCPacket::newpkt(*_route,_flow, _highest_sent+1, _mss, currentTimestamp);
+    sentTimestamps[_highest_sent + 1] = currentTimestamp;
 
-    p = CCPacket::newpkt(*_route,_flow, _highest_sent+1, _mss, eventlist().now());
-    
     _highest_sent += _mss;
     _packets_sent++;
 
     _flightsize += _mss;
 
-    //cout << "Sent " << _highest_sent+1 << " Flow Size: " << _flow_size << " Flow " << _name << " time " << timeAsUs(eventlist().now()) << endl;
+    // Debugging information
+    // cout << "Packet sent: _highest_sent=" << _highest_sent << ", _flightsize=" << _flightsize << endl;
+
+    //// cout << "Sent " << _highest_sent+1 << " Flow Size: " << _flow_size << " Flow " << _name << " time " << timeAsUs(eventlist().now()) << endl;
     p->sendOn();
 }
 
@@ -227,12 +309,12 @@ void CCSink::receivePacket(Packet& pkt) {
     
         p->free();
 
-        //cout << "Wrong seqno received at CC SINK " << seqno << " expecting " << _cumulative_ack << endl;
+        //// cout << "Wrong seqno received at CC SINK " << seqno << " expecting " << _cumulative_ack << endl;
         return;
     }
 
     int size = p->size()-ACKSIZE; 
-    _total_received += Packet::data_packet_size();;
+    _total_received += Packet::data_packet_size();
 
     bool ecn = (bool)(pkt.flags() & ECN_CE);
 
