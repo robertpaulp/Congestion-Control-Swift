@@ -31,6 +31,8 @@ double _max_mdfs;
 double _hops;
 double _hop_scale;
 int _retransmit_count;
+int _duplicate_acks;
+int _last_no_ack;
 const int RETX_RESET_THRESHOLD = 3; 
 double _pacing_delay;
 
@@ -58,6 +60,8 @@ CCSrc::CCSrc(EventList &eventlist)
     _fsRange = 2;
     _pacing_delay = 0;
     _base_delay = 1;
+     _duplicate_acks = 0;
+    _last_no_ack = 0;
     _target_delay = 10;
     _hops = 3;
     _hop_scale = 1;
@@ -123,6 +127,9 @@ void updateTargetDelay(double _cwnd_aux) {
     _target_delay = _base_delay + (_hops * _hop_scale);
     _target_delay += std::max(0.0, std::min(1 / sqrt(_cwnd_aux) + _beta, _fsRange));
 }
+bool can_decrease(simtime_picosec current_time, simtime_picosec rtt) {
+    return (current_time - _lastDecrease) >= rtt;
+}
 
 // Aceasta functie este apelata atunci cand dimensiunea cozii a fost depasita iar packetul cu numarul de secventa ackno a fost aruncat.
 void CCSrc::processAck(const CCAck& ack) {
@@ -142,24 +149,35 @@ void CCSrc::processAck(const CCAck& ack) {
         // cout << "RTT for sequence number " << ackno << ": " << timeAsMs(rtt) << " ms" << endl;
         sentTimestamps.erase(it); // Remove the timestamp entry after calculating RTT
     }
-
+    if (ackno == _last_no_ack) {
+        _duplicate_acks++;
+    } else {
+        _last_no_ack = ackno;
+        _duplicate_acks = 0;
+    }
     // Reset retransmission count on receiving a valid ACK
     _retransmit_count = 0;
-    updateTargetDelay(_cwnd);
-    if (ack.is_ecn_marked()) {
-        if (currentTimestamp - _lastDecrease >= timeAsMs(rtt)) {
-            _cwnd *= (1.0 - _beta * (timeAsMs(rtt))/_target_delay); // Multiplicative decrease
+    if (_duplicate_acks >= 3) {
+        if (can_decrease(currentTimestamp, rtt)) {
+            _cwnd = (1 - _beta) * _cwnd;
         }
-    } else {
-        // Increase the congestion window
-        if (_cwnd < _ssthresh) {
-            // Slow start phase
-            _cwnd += _mss*_ai;    
+    } else{
+        updateTargetDelay(_cwnd);
+        if (ack.is_ecn_marked()) {
+            if (can_decrease(currentTimestamp, timeAsMs(rtt))) {
+                _cwnd *= (1.0 - _beta * (timeAsMs(rtt))/_target_delay); // Multiplicative decrease
+            }
         } else {
-            // Congestion avoidance phase
-            _cwnd += (_ai * _mss) / _cwnd;
+            // Increase the congestion window
+            if (_cwnd < _ssthresh) {
+                // Slow start phase
+                _cwnd += _mss*_ai;    
+            } else {
+                // Congestion avoidance phase
+                _cwnd += (_ai * _mss) / _cwnd;
+            }
+            _next_decision = _highest_sent + _cwnd;  
         }
-         _next_decision = _highest_sent + _cwnd;  
     }
 
     // Ensure the congestion window stays within bounds
@@ -169,8 +187,10 @@ void CCSrc::processAck(const CCAck& ack) {
     }
 
     // Calculate pacing delay
-    _pacing_delay = timeAsMs(rtt) / _cwnd;
-
+    if(_cwnd < 1)
+        _pacing_delay = timeAsMs(rtt) / _cwnd;
+    else
+        _pacing_delay = 0;
     // Debugging information
     // cout << "ACK processed: _cwnd=" << _cwnd << ", _pacing_delay=" << _pacing_delay << endl;
 
@@ -211,7 +231,10 @@ void CCSrc::processNack(const CCNack& nack) {
     }
 
     // Calculate pacing delay
-    _pacing_delay = timeAsMs(rtt) / _cwnd;
+    if(_cwnd < 1)
+        _pacing_delay = timeAsMs(rtt) / _cwnd;
+    else
+        _pacing_delay = 0;
 
     // Debugging information
     // cout << "NACK processed: _cwnd=" << _cwnd << ", _pacing_delay=" << _pacing_delay << endl;
