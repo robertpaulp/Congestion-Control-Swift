@@ -27,7 +27,7 @@ double _base_delay;
 simtime_picosec _lastDecrease;
 double _ai;
 double _fsRange;
-//double _max_mdfs;
+double _max_mdfs;
 double _hops;
 double _hop_scale;
 int _retransmit_count;
@@ -54,7 +54,7 @@ CCSrc::CCSrc(EventList &eventlist)
     _min_cwnd = _mss;
     _cwnd_prev = _cwnd;
     _ai = 0.7;
-    //_max_mdfs = -10;
+    _max_mdfs = 0.5;
     _fsRange = 2;
     _pacing_delay = 0;
     _base_delay = 1;
@@ -147,10 +147,8 @@ void CCSrc::processAck(const CCAck& ack) {
     _retransmit_count = 0;
     updateTargetDelay(_cwnd);
     if (ack.is_ecn_marked()) {
-        // Handle ECN marked ACK
         if (currentTimestamp - _lastDecrease >= timeAsMs(rtt)) {
             _cwnd *= (1.0 - _beta * (timeAsMs(rtt))/_target_delay); // Multiplicative decrease
-            _lastDecrease = currentTimestamp;
         }
     } else {
         // Increase the congestion window
@@ -200,7 +198,7 @@ void CCSrc::processNack(const CCNack& nack) {
     if (_retransmit_count >= RETX_RESET_THRESHOLD) {
         _cwnd = _min_cwnd; // Drastic reduction for repeated timeouts
     } else {
-        _cwnd *= (1.0 - _beta); // Multiplicative decrease
+        _cwnd *= (1.0 - _max_mdfs); // Multiplicative decrease
         _ssthresh = _cwnd;
         _next_decision = _highest_sent + _cwnd;  
 
