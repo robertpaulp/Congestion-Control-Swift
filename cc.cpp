@@ -22,14 +22,16 @@ double _max_cwnd;
 double _min_cwnd;
 double _alpha;
 double _beta;
+double _target_delay;
+double _base_delay;
 simtime_picosec _lastDecrease;
 double _ai;
 double _fsRange;
-double _max_mdfs;
+//double _max_mdfs;
 double _hops;
 double _hop_scale;
 int _retransmit_count;
-const int RETX_RESET_THRESHOLD = 3; // Example threshold, commonly set to 3
+const int RETX_RESET_THRESHOLD = 3; 
 double _pacing_delay;
 
 CCSrc::CCSrc(EventList &eventlist)
@@ -51,10 +53,12 @@ CCSrc::CCSrc(EventList &eventlist)
     _max_cwnd = 100000 * _mss;
     _min_cwnd = _mss;
     _cwnd_prev = _cwnd;
-    _ai = 10;
-    _max_mdfs = 10;
+    _ai = 0.7;
+    //_max_mdfs = -10;
     _fsRange = 2;
     _pacing_delay = 0;
+    _base_delay = 1;
+    _target_delay = 10;
     _hops = 3;
     _hop_scale = 1;
     _retransmit_count = 0;
@@ -115,6 +119,10 @@ unordered_map<uint32_t, simtime_picosec> sentTimestamps;
 double clamp(double min_val, double val, double max_val) {
     return std::max(min_val, std::min(val, max_val));
 }
+void updateTargetDelay(double _cwnd_aux) {
+    _target_delay = _base_delay + (_hops * _hop_scale);
+    _target_delay += std::max(0.0, std::min(1 / sqrt(_cwnd_aux) + _beta, _fsRange));
+}
 
 // Aceasta functie este apelata atunci cand dimensiunea cozii a fost depasita iar packetul cu numarul de secventa ackno a fost aruncat.
 void CCSrc::processAck(const CCAck& ack) {
@@ -137,22 +145,23 @@ void CCSrc::processAck(const CCAck& ack) {
 
     // Reset retransmission count on receiving a valid ACK
     _retransmit_count = 0;
-
+    updateTargetDelay(_cwnd);
     if (ack.is_ecn_marked()) {
         // Handle ECN marked ACK
         if (currentTimestamp - _lastDecrease >= timeAsMs(rtt)) {
-            _cwnd *= (1.0 - _beta); // Multiplicative decrease
+            _cwnd *= (1.0 - _beta * (timeAsMs(rtt))/_target_delay); // Multiplicative decrease
             _lastDecrease = currentTimestamp;
         }
     } else {
         // Increase the congestion window
         if (_cwnd < _ssthresh) {
             // Slow start phase
-            _cwnd += _mss;    
+            _cwnd += _mss*_ai;    
         } else {
             // Congestion avoidance phase
             _cwnd += (_ai * _mss) / _cwnd;
         }
+         _next_decision = _highest_sent + _cwnd;  
     }
 
     // Ensure the congestion window stays within bounds
@@ -192,6 +201,9 @@ void CCSrc::processNack(const CCNack& nack) {
         _cwnd = _min_cwnd; // Drastic reduction for repeated timeouts
     } else {
         _cwnd *= (1.0 - _beta); // Multiplicative decrease
+        _ssthresh = _cwnd;
+        _next_decision = _highest_sent + _cwnd;  
+
     }
 
     // Ensure the congestion window stays within bounds
