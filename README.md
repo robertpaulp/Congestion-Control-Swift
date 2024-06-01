@@ -35,3 +35,9 @@ You can run this online on
 [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/git/https%3A%2F%2Fgitlab.cs.pub.ro%2Fpcom%2Fcongestion-control-project.git/main?labpath=sim%2FProject_CongestionControl.ipynb).
 It will take around ~5 min to start your notebook. Don't forget to save the
 changes you've made to the c files locally.
+
+
+## Used files
+https://2022-cs244.github.io/papers/L5-swift.pdf
+https://github.com/ani2796/swift-start-ns3/blob/master/tcp-swiftstart.cc
+https://github.com/rsburke4/ns3-swift/blob/master/ns3/src/internet/model/tcp-swift.cc#L319
